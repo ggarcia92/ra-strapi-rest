@@ -1,4 +1,3 @@
-import { stringify } from 'query-string';
 import {
     fetchUtils,
     GET_LIST,
@@ -14,9 +13,6 @@ import {
 
 /**
  * Maps react-admin queries to a simple REST API
- *
- * The REST dialect is similar to the one of FakeRest
- * @see https://github.com/marmelab/FakeRest
  * @example
  * GET_LIST     => GET http://my.api.url/posts?sort=['title','ASC']&range=[0, 24]
  * GET_ONE      => GET http://my.api.url/posts/123
@@ -25,7 +21,7 @@ import {
  * CREATE       => POST http://my.api.url/posts
  * DELETE       => DELETE http://my.api.url/posts/123
  */
-export default (apiUrl, httpClient = fetchUtils.fetchJson) => {
+export default (apiUrl, httpClient = fetchUtils.fetchJson, uploadFields = []) => {
     /**
      * @param {String} type One of the constants appearing at the top if this file, e.g. 'UPDATE'
      * @param {String} resource Name of the resource to fetch, e.g. 'posts'
@@ -36,23 +32,19 @@ export default (apiUrl, httpClient = fetchUtils.fetchJson) => {
         let url = '';
         const options = {};
         switch (type) {
-            case GET_LIST: {
-                const query = adjustQueryForStrapi(params);
-                url = `${apiUrl}/${resource}?${query}`;
+            case GET_LIST:
+            case GET_MANY_REFERENCE:
+                url = `${apiUrl}/${resource}?${adjustQueryForStrapi(params)}`;
                 break;
-            }
             case GET_ONE:
                 url = `${apiUrl}/${resource}/${params.id}`;
                 break;
-            case GET_MANY_REFERENCE: {
-                const query = adjustQueryForStrapi(params);
-                url = `${apiUrl}/${resource}?${query}`;
-                break;
-            }
             case UPDATE:
                 url = `${apiUrl}/${resource}/${params.id}`;
                 options.method = 'PUT';
-                options.body = JSON.stringify(params.data);
+                // Omit created_at/updated_at(RDS) and createdAt/updatedAt(Mongo) in request body
+                const {created_at, updated_at, createdAt, updatedAt, ...data} = params.data;
+                options.body = JSON.stringify(data);
                 break;
             case CREATE:
                 url = `${apiUrl}/${resource}`;
@@ -90,11 +82,12 @@ export default (apiUrl, httpClient = fetchUtils.fetchJson) => {
         let filter = "";
         const keys = Object.keys(f);
         for(let i = 0; i < keys.length; i++){
-            if (keys[i] === "q") {//react-admin uses q filter in several components and strapi use _q
-                if (f[keys[i]] !== '')
-                    filter += "_q=" + f[keys[i]] + (keys[i + 1] ? "&" : "")
-            } else
+            //react-admin uses q filter in several components and strapi use _q
+            if (keys[i] === "q" && f[keys[i]] !== '') {
+                filter += "_q=" + f[keys[i]] + (keys[i + 1] ? "&" : "")
+            } else {
                 filter += keys[i] + "=" + f[keys[i]] + (keys[i + 1] ? "&" : "");
+            }
         }
         if(params.id && params.target && params.target.indexOf('_id') !== -1){
             const target = params.target.substring(0, params.target.length - 3);
@@ -108,7 +101,70 @@ export default (apiUrl, httpClient = fetchUtils.fetchJson) => {
         const range = "_start=" + start + "&_limit=" + limit;
 
         return sort + "&" + range + "&" + filter; 
-        
+    }
+    
+    // Determines if there are new files to upload
+    const determineUploadFieldNames = params => {
+	if (!params.data) return [];
+
+	// Check if the field names are mentioned in the uploadFields
+	// and verify there are new files being added
+	const requestUplaodFieldNames = [];
+	Object.keys(params.data).forEach(field => {
+	   let fieldData = params.data[field];
+	   if (uploadFields.includes(field)) {
+	      fieldData = !Array.isArray(fieldData) ? [fieldData] : fieldData;
+	      fieldData.filter(f => f && f.rawFile instanceof File).length > 0 
+		  && requestUplaodFieldNames.push(field);
+	   }
+	});
+	
+	// Return an array of field names where new files are added
+	return requestUplaodFieldNames;
+     };
+    
+    // Handles file uploading for CREATE and UPDATE types
+    const handleFileUpload = (type, resource, params, uploadFieldNames) => {
+	const { created_at, updated_at, createdAt, updatedAt, ...data } = params.data;
+	const id = type === UPDATE ? `/${params.id}` : "";
+	const url = `${apiUrl}/${resource}${id}`;
+	const requestMethod = type === UPDATE ? "PUT" : "POST";
+	const formData = new FormData();
+
+	for (let fieldName of uploadFieldNames) {
+	    let fieldData = params.data[fieldName];
+	    fieldData = !Array.isArray(fieldData) ? [fieldData] : fieldData;
+	    const existingFileIds = [];
+	    
+	    for (let item of fieldData) {
+		item.rawFile instanceof File
+		  ? formData.append(`files.${fieldName}`, item.rawFile)
+		  : existingFileIds.push(item.id || item._id);
+	    }
+
+	    data[fieldName] = [...existingFileIds];
+	}
+	formData.append("data", JSON.stringify(data));
+
+	return httpClient(url, {
+	    method: requestMethod,
+	    body: formData
+	}).then(response => ({ data: replaceRefObjectsWithIds(response.json) }));
+    };
+    
+    // Replace reference objects with reference object IDs	
+    const replaceRefObjectsWithIds = json => {
+    	Object.keys(json).forEach(key => {
+	    const fd = json[key]; // field data
+	    const referenceKeys = [];
+	    if (fd && (fd.id || fd._id) && !fd.mime) {
+	        json[key] = fd.id || fd._id;
+	    } else if (Array.isArray(fd) && fd.length > 0 && !fd[0].mime) {
+	        fd.map(item => referenceKeys.push(item.id || item._id));
+	        json[key] = referenceKeys;
+	    }
+	});
+	return json;
     }
 
     /**
@@ -119,27 +175,20 @@ export default (apiUrl, httpClient = fetchUtils.fetchJson) => {
      * @returns {Object} Data response
      */
     const convertHTTPResponse = (response, type, resource, params) => {
-        const { headers, json } = response;
+        const { headers, json, total } = response;
         switch (type) {
+	    case GET_ONE:
+	        return { data: replaceRefObjectsWithIds(json) };
             case GET_LIST:
             case GET_MANY_REFERENCE:
-                if (!headers.has('content-range')) {
-                    throw new Error(
-                        'The Content-Range header is missing in the HTTP Response. The simple REST data provider expects responses for lists of resources to contain this header with the total number of results to build the pagination. If you are using CORS, did you declare Content-Range in the Access-Control-Expose-Headers header?'
-                    );
-                }
                 return {
                     data: json,
-                    total: parseInt(
-                        headers
-                            .get('content-range')
-                            .split('/')
-                            .pop(),
-                        10
-                    ),
+                    total
                 };
             case CREATE:
                 return { data: { ...params.data, id: json.id } };
+            case DELETE:
+                return { data: { id: null } };
             default:
                 return { data: json };
         }
@@ -152,15 +201,24 @@ export default (apiUrl, httpClient = fetchUtils.fetchJson) => {
      * @returns {Promise} the Promise for a data response
      */
     return (type, resource, params) => {
+        
+        // Handle file uploading
+	const uploadFieldNames = determineUploadFieldNames(params);
+	if (uploadFieldNames.length > 0) {
+	    return handleFileUpload(type, resource, params, uploadFieldNames);
+	}
+        
         // simple-rest doesn't handle filters on UPDATE route, so we fallback to calling UPDATE n times instead
         if (type === UPDATE_MANY) {
             return Promise.all(
-                params.ids.map(id =>
-                    httpClient(`${apiUrl}/${resource}/${id}`, {
+                params.ids.map(id => {
+                    // Omit created_at/updated_at(RDS) and createdAt/updatedAt(Mongo) in request body
+                    const {created_at, updated_at, createdAt, updatedAt, ...data} = params.data;
+                    return httpClient(`${apiUrl}/${resource}/${id}`, {
                         method: 'PUT',
-                        body: JSON.stringify(params.data),
+                        body: JSON.stringify(data),
                     })
-                )
+                })
             ).then(responses => ({
                 data: responses.map(response => response.json),
             }));
@@ -180,8 +238,8 @@ export default (apiUrl, httpClient = fetchUtils.fetchJson) => {
         //strapi doesn't handle filters in GET route
         if (type === GET_MANY) {
             return Promise.all(
-                params.ids.map(id =>
-                    httpClient(`${apiUrl}/${resource}/${id}`, {
+                params.ids.map(i =>
+                    httpClient(`${apiUrl}/${resource}/${i.id || i._id || i}`, {
                         method: 'GET',
                     })
                 )
@@ -195,8 +253,29 @@ export default (apiUrl, httpClient = fetchUtils.fetchJson) => {
             resource,
             params
         );
-        return httpClient(url, options).then(response =>
-            convertHTTPResponse(response, type, resource, params)
-        );
+
+        // Get total via model/count endpoint
+        if (type === GET_MANY_REFERENCE || type === GET_LIST) {
+            const { url: urlForCount } = convertDataRequestToHTTP(
+                type,
+                resource + "/count",
+                params
+            );
+            return Promise.all([
+                httpClient(url, options),
+                httpClient(urlForCount, options),
+            ]).then(promises => {
+                const response = {
+                    ...promises[0],
+                    // Add total for further use
+                    total: parseInt(promises[1].json, 10),
+                };
+                return convertHTTPResponse(response, type, resource, params);
+            });
+        } else {
+            return httpClient(url, options).then((response) =>
+                convertHTTPResponse(response, type, resource, params)
+            );
+        }
     };
-};
+}; 
